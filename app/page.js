@@ -1,181 +1,292 @@
-// Teltrip data layer: subscribers + packages + aggregated usage (Jun 1 → today)
+// app/page.js
+"use client";
 
-const BASE = process.env.OCS_BASE_URL;
-const TOKEN = process.env.OCS_TOKEN;
-const DEFAULT_ACCOUNT_ID = parseInt(process.env.OCS_ACCOUNT_ID || "0", 10);
-const RANGE_START_YMD = "2025-06-01";
+import React, { useEffect, useMemo, useState, Fragment } from "react";
+import * as XLSX from "xlsx";
 
-function must(v, name) { if (!v) throw new Error(`${name} missing`); return v; }
-const toYMD = (d) => d.toISOString().slice(0, 10);
-
-// ---------- core fetch ----------
-async function callOCS(payload) {
-  must(BASE, "OCS_BASE_URL"); must(TOKEN, "OCS_TOKEN");
-  const url = `${BASE}?token=${encodeURIComponent(TOKEN)}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25000);
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    cache: "no-store",
-    signal: controller.signal
-  }).finally(() => clearTimeout(timer));
-  const text = await r.text();
-  let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}${text ? " :: " + text.slice(0,300) : ""}`);
+// safe fetch
+async function safeFetch(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  const txt = await res.text();
+  let json = null; try { json = txt ? JSON.parse(txt) : null; } catch {}
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? " :: " + txt.slice(0,300) : ""}`);
   return json ?? {};
 }
 
-// ---------- small worker pool ----------
-async function pMap(list, fn, concurrency = 5) {
-  const out = new Array(list.length);
-  let i = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, list.length) }, async () => {
-      while (i < list.length) {
-        const idx = i++;
-        out[idx] = await fn(list[idx], idx);
+// utils
+const bytesToGB = (b) => (b == null || isNaN(b)) ? "" : (Number(b) / (1024 ** 3)).toFixed(2);
+const money = (n) => (n == null || isNaN(n)) ? "" : Number(n).toFixed(2);
+const fmtDT = (s) => typeof s === "string" ? s.replace("T", " ") : s ?? "";
+
+// columns
+const columns = [
+  "ICCID","IMSI","phoneNumber","subscriberStatus","simStatus","esim","activationCode",
+  "activationDate","lastUsageDate","prepaid","balance","account","reseller","lastMcc","lastMnc",
+  "prepaidpackagetemplatename","prepaidpackagetemplateid","tsactivationutc","tsexpirationutc","pckdatabyte","useddatabyte","pckdata(GB)","used(GB)",
+  "subscriberOneTimeCost","usageSinceJun1(GB)","resellerCostSinceJun1"
+];
+
+export default function Page() {
+  const [accountId, setAccountId] = useState("3771");
+  const [rows, setRows] = useState([]);
+  const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  const [accounts, setAccounts] = useState([]);
+  const [accountSearch, setAccountSearch] = useState("");
+
+  const logoSrc = process.env.NEXT_PUBLIC_LOGO_URL || "/logo.png";
+
+  // load accounts (listResellerAccount → flattened in API)
+  async function loadAccounts() {
+    const url = "/api/accounts";
+    const r = await fetch(url, { cache: "no-store" });
+    const t = await r.text(); let j=null; try{ j=t?JSON.parse(t):null; }catch{}
+    if (j?.ok && Array.isArray(j.data)) {
+      setAccounts(j.data);
+      if (!j.data.some(a => String(a.id) === String(accountId)) && j.data.length) {
+        setAccountId(String(j.data[0].id));
       }
-    })
-  );
-  return out;
-}
-
-function latestByDate(arr) {
-  if (!Array.isArray(arr) || !arr.length) return null;
-  return arr.slice().sort((a,b)=>new Date(a.startDate||0)-new Date(b.startDate||0)).at(-1);
-}
-
-// ---------- template cost ----------
-const templateCostCache = new Map();
-
-async function fetchTemplateCost(templateId) {
-  if (!templateId) return null;
-  if (templateCostCache.has(templateId)) return templateCostCache.get(templateId);
-  const resp = await callOCS({ getPrepaidPackageTemplate: { prepaidPackageTemplateId: templateId } });
-  const tpl = resp?.prepaidPackageTemplate || {};
-  const cost = Number(tpl.cost ?? tpl.price ?? tpl.amount ?? tpl.subscriberCost ?? NaN);
-  const val = {
-    cost: Number.isFinite(cost) ? cost : null,
-    currency: tpl.currency ?? null,
-    name: tpl.name ?? null
-  };
-  templateCostCache.set(templateId, val);
-  return val;
-}
-
-// ---------- packages ----------
-async function fetchPackagesFor(subscriberId) {
-  const resp = await callOCS({ listSubscriberPrepaidPackages: { subscriberId } });
-  const pkgs = resp?.listSubscriberPrepaidPackages?.packages || [];
-  if (!pkgs.length) return null;
-  pkgs.sort((a,b)=> new Date(a.tsactivationutc||0) - new Date(b.tsactivationutc||0));
-  const p = pkgs.at(-1);
-  const tpl = p?.packageTemplate || {};
-  return {
-    prepaidpackagetemplatename: tpl.prepaidpackagetemplatename ?? tpl.name ?? null,
-    prepaidpackagetemplateid: tpl.prepaidpackagetemplateid ?? tpl.id ?? null,
-    tsactivationutc: p?.tsactivationutc ?? null,
-    tsexpirationutc: p?.tsexpirationutc ?? null,
-    pckdatabyte: p?.pckdatabyte ?? null,
-    useddatabyte: p?.useddatabyte ?? null
-  };
-}
-
-// ---------- usage windows ----------
-function addDays(base, n) { const d = new Date(base); d.setDate(d.getDate() + n); return d; }
-function parseYMD(s) { const [y,m,d]=s.split("-").map(Number); return new Date(Date.UTC(y, m-1, d)); }
-function* weekWindows(startYMD, endYMD) {
-  let start = parseYMD(startYMD);
-  const endHard = parseYMD(endYMD);
-  while (start <= endHard) {
-    const end = addDays(start, 6);
-    const endClamped = end > endHard ? endHard : end;
-    yield { start: toYMD(start), end: toYMD(endClamped) };
-    start = addDays(endClamped, 1);
-  }
-}
-
-async function fetchUsageWindow(subscriberId, startYMD, endYMD) {
-  const resp = await callOCS({
-    subscriberUsageOverPeriod: {
-      subscriber: { subscriberId },
-      period: { start: startYMD, end: endYMD }
     }
+  }
+  useEffect(() => { loadAccounts(); }, []);
+
+  // load data for selected account
+  async function load() {
+    setErr(""); setLoading(true);
+    try {
+      const url = new URL("/api/fetch-data", window.location.origin);
+      if (accountId) url.searchParams.set("accountId", String(accountId).trim());
+      const payload = await safeFetch(url.toString());
+      if (payload?.ok === false) throw new Error(payload.error || "API error");
+      setRows(Array.isArray(payload?.data) ? payload.data : []);
+      if (!Array.isArray(payload?.data)) setErr("No data array. Check env/token/accountId.");
+    } catch (e) {
+      setRows([]); setErr(e.message || "Failed");
+    } finally { setLoading(false); }
+  }
+  useEffect(() => { load(); }, [accountId]); // reload when account changes
+
+  // filter rows
+  const filtered = useMemo(() => {
+    const n = q.trim().toLowerCase();
+    if (!n) return rows;
+    return rows.filter(r => Object.values(r).some(v => String(v ?? "").toLowerCase().includes(n)));
+  }, [rows, q]);
+
+  // totals (current account) + PNL
+  const totals = useMemo(() => {
+    let totalReseller = 0;
+    let totalSubscriberOneTime = 0;
+    for (const r of rows) {
+      if (Number.isFinite(r?.resellerCostSinceJun1)) totalReseller += Number(r.resellerCostSinceJun1);
+      if (Number.isFinite(r?.subscriberOneTimeCost)) totalSubscriberOneTime += Number(r.subscriberOneTimeCost);
+    }
+    const pnl = totalSubscriberOneTime - totalReseller;
+    return { totalReseller, totalSubscriberOneTime, pnl };
+  }, [rows]);
+
+  // export buttons
+  function exportCSV() {
+    const headers = [...columns];
+    const lines = [headers.join(",")];
+    filtered.forEach(r => {
+      lines.push([
+        r.iccid ?? "", r.imsi ?? "", r.phoneNumber ?? "", r.subscriberStatus ?? "", r.simStatus ?? "", String(r.esim ?? ""),
+        r.activationCode ?? "", fmtDT(r.activationDate), fmtDT(r.lastUsageDate), String(r.prepaid ?? ""), r.balance ?? "",
+        r.account ?? "", r.reseller ?? "", r.lastMcc ?? "", r.lastMnc ?? "",
+        r.prepaidpackagetemplatename ?? "", r.prepaidpackagetemplateid ?? "", fmtDT(r.tsactivationutc), fmtDT(r.tsexpirationutc),
+        r.pckdatabyte ?? "", r.useddatabyte ?? "", bytesToGB(r.pckdatabyte), bytesToGB(r.useddatabyte),
+        money(r.subscriberOneTimeCost), bytesToGB(r.totalBytesSinceJun1), money(r.resellerCostSinceJun1)
+      ].map(x => `"${String(x).replace(/"/g, '""')}"`).join(","));
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+    a.href = url; a.download = `teltrip_dashboard_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
+  }
+
+  function exportExcel() {
+    const data = filtered.map(r => ({
+      ICCID: r.iccid ?? "",
+      IMSI: r.imsi ?? "",
+      phoneNumber: r.phoneNumber ?? "",
+      subscriberStatus: r.subscriberStatus ?? "",
+      simStatus: r.simStatus ?? "",
+      esim: String(r.esim ?? ""),
+      activationCode: r.activationCode ?? "",
+      activationDate: fmtDT(r.activationDate),
+      lastUsageDate: fmtDT(r.lastUsageDate),
+      prepaid: String(r.prepaid ?? ""),
+      balance: r.balance ?? "",
+      account: r.account ?? "",
+      reseller: r.reseller ?? "",
+      lastMcc: r.lastMcc ?? "",
+      lastMnc: r.lastMnc ?? "",
+      prepaidpackagetemplatename: r.prepaidpackagetemplatename ?? "",
+      prepaidpackagetemplateid: r.prepaidpackagetemplateid ?? "",
+      tsactivationutc: fmtDT(r.tsactivationutc),
+      tsexpirationutc: fmtDT(r.tsexpirationutc),
+      pckdatabyte: r.pckdatabyte ?? "",
+      useddatabyte: r.useddatabyte ?? "",
+      "pckdata(GB)": bytesToGB(r.pckdatabyte),
+      "used(GB)": bytesToGB(r.useddatabyte),
+      subscriberOneTimeCost: money(r.subscriberOneTimeCost),
+      "usageSinceJun1(GB)": bytesToGB(r.totalBytesSinceJun1),
+      resellerCostSinceJun1: money(r.resellerCostSinceJun1)
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Teltrip");
+    XLSX.writeFile(wb, `teltrip_dashboard_${new Date().toISOString().slice(0,10)}.xlsx`);
+  }
+
+  // styles
+  const colW = 170;
+  const headerBox = { padding:"10px 12px", background:"#eaf6c9", borderBottom:"1px solid #cbd5a7", fontWeight:600, color:"#000" };
+  const cellBox = (i) => ({
+    padding:"10px 12px",
+    borderBottom:"1px solid #cbd5a7",
+    background: i%2? "#ffffff":"#f6fadf",
+    wordBreak:"break-all",
+    color:"#000"
   });
-  const total = resp?.subscriberUsageOverPeriod?.total || {};
-  const qty = total?.quantityPerType || {};
-  const bytes = typeof qty["33"] === "number" ? qty["33"] : null;
-  const resellerCost = Number.isFinite(total?.resellerCost) ? total.resellerCost : null;
-  return { bytes, resellerCost };
-}
 
-async function fetchAggregatedUsage(subscriberId) {
-  const todayYMD = toYMD(new Date());
-  const windows = Array.from(weekWindows(RANGE_START_YMD, todayYMD));
-  let sumBytes = 0, sumResCost = 0;
-  await pMap(windows, async (win) => {
-    const { bytes, resellerCost } = await fetchUsageWindow(subscriberId, win.start, win.end);
-    if (Number.isFinite(bytes)) sumBytes += bytes;
-    if (Number.isFinite(resellerCost)) sumResCost += resellerCost;
-  }, 6);
-  return { sumBytes, sumResCost };
-}
+  const logout = async () => {
+    await fetch("/api/logout", { method: "POST" });
+    window.location.href = "/login";
+  };
 
-// ---------- main ----------
-export async function fetchAllData(accountIdParam) {
-  const accountId = parseInt(accountIdParam || DEFAULT_ACCOUNT_ID || "0", 10);
-  if (!accountId) throw new Error("Provide accountId");
+  return (
+    <main style={{ padding: 24, maxWidth: 1800, margin: "0 auto", background:"#eff4db", color:"#000" }}>
+      {/* header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom: 12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <img src={logoSrc} alt="Teltrip" style={{ height: 48 }} />
+          <h1 style={{ margin:0 }}>Teltrip Dashboard</h1>
+        </div>
+        <button onClick={logout} style={{ padding:"8px 12px", borderRadius:10, border:"1px solid #cbd5a7", background:"#e6f3c2", cursor:"pointer" }}>
+          Logout
+        </button>
+      </div>
 
-  const subsResp = await callOCS({ listSubscriber: { accountId } });
-  const subscribers = subsResp?.listSubscriber?.subscriberList || [];
+      {/* ACCOUNTS: dropdown + refresh + filter */}
+      <div style={{ display:"grid", gridTemplateColumns:"280px auto 260px", gap:12, alignItems:"center", marginBottom:10 }}>
+        <select
+          value={String(accountId)}
+          onChange={e=>{ setAccountId(e.target.value); }}
+          style={{ padding:"10px 12px", borderRadius:10, border:"1px solid #cbd5a7", background:"#fff", color:"#000", width:"100%" }}
+        >
+          {accounts
+            .filter(a => (a.name || "").toLowerCase().includes((accountSearch||"").toLowerCase()))
+            .map(a => <option key={a.id} value={String(a.id)}>{a.name} — {a.id}</option>)
+          }
+          {accounts.length === 0 && <option>Loading accounts…</option>}
+        </select>
 
-  const rows = subscribers.map((s) => {
-    const iccid = s?.imsiList?.[0]?.iccid ?? s?.sim?.iccid ?? null;
-    const st = latestByDate(s?.status) || null;
-    return {
-      iccid,
-      activationDate: s?.activationDate ?? null,
-      lastUsageDate: s?.lastUsageDate ?? null,
-      subscriberStatus: st?.status ?? null,
-      account: s?.account ?? null,
-      prepaidpackagetemplatename: null,
-      prepaidpackagetemplateid: null,
-      tsactivationutc: null,
-      tsexpirationutc: null,
-      pckdatabyte: null,
-      useddatabyte: null,
-      subscriberOneTimeCost: null,
-      totalBytesSinceJun1: null,
-      resellerCostSinceJun1: null,
-      _sid: s?.subscriberId ?? null
-    };
-  });
+        <button
+          onClick={loadAccounts}
+          style={{ padding:"8px 14px", borderRadius:10, border:"1px solid #cbd5a7", background:"#e6f3c2", color:"#000", cursor:"pointer", justifySelf:"start" }}
+        >
+          Refresh accounts
+        </button>
 
-  await pMap(rows, async (r) => {
-    if (!r._sid) return;
-    try {
-      const pkg = await fetchPackagesFor(r._sid);
-      if (pkg) Object.assign(r, pkg);
-    } catch {}
+        <input
+          placeholder="Filter accounts by name…"
+          value={accountSearch}
+          onChange={e=>setAccountSearch(e.target.value)}
+          style={{ padding:"10px 12px", borderRadius:10, border:"1px solid #cbd5a7", background:"#fff", color:"#000", width:"100%" }}
+        />
+      </div>
 
-    try {
-      if (r.prepaidpackagetemplateid) {
-        const tpl = await fetchTemplateCost(r.prepaidpackagetemplateid);
-        if (tpl?.cost != null) r.subscriberOneTimeCost = tpl.cost;
-        if (tpl?.name && !r.prepaidpackagetemplatename) r.prepaidpackagetemplatename = tpl.name;
-      }
-    } catch {}
+      {/* top controls + totals + PNL */}
+      <header style={{ display:"grid", gridTemplateColumns:"auto 1fr auto auto 260px", gap:12, alignItems:"center", marginBottom:14 }}>
+        <h2 style={{ margin:0, color:"#000" }}>Overview</h2>
 
-    try {
-      const aggr = await fetchAggregatedUsage(r._sid);
-      r.totalBytesSinceJun1 = aggr.sumBytes;
-      r.resellerCostSinceJun1 = aggr.sumResCost;
-    } catch {}
+        <div style={{
+          justifySelf:"start",
+          display:"flex",
+          gap:12,
+          alignItems:"center",
+          background:"#fff",
+          border:"1px solid #cbd5a7",
+          borderRadius:10,
+          padding:"8px 12px",
+          color:"#000",
+          whiteSpace:"nowrap"
+        }}>
+          <div><b>Total Subscriber Cost:</b> {money(totals.totalSubscriberOneTime)}</div>
+          <div>|</div>
+          <div><b>Total Reseller Cost:</b> {money(totals.totalReseller)}</div>
+          <div>|</div>
+          <div><b>PNL:</b> {money(totals.pnl)}</div>
+        </div>
 
-    delete r._sid;
-  }, 6);
+        <button onClick={load} disabled={loading}
+          style={{ padding:"8px 14px", borderRadius:10, border:"1px solid #cbd5a7", background:"#cfeaa1", color:"#000", cursor:"pointer" }}>
+          {loading ? "Loading…" : "Reload"}
+        </button>
 
-  return rows;
+        <button onClick={exportCSV}
+          style={{ padding:"8px 14px", borderRadius:10, border:"1px solid #cbd5a7", background:"#e6f3c2", color:"#000", cursor:"pointer" }}>
+          Export CSV
+        </button>
+
+        <button onClick={exportExcel}
+          style={{ padding:"8px 14px", borderRadius:10, border:"1px solid #cbd5a7", background:"#bfe080", color:"#000", cursor:"pointer" }}>
+          Export Excel
+        </button>
+      </header>
+
+      {err && (
+        <div style={{ background:"#ffefef", border:"1px solid '#e5a5a5'", color:"#900", padding:"10px 12px", borderRadius:10, marginBottom:12, whiteSpace:"pre-wrap", fontSize:12 }}>
+          {err}
+        </div>
+      )}
+
+      {/* table */}
+      <div style={{ overflowX:"auto", border:"1px solid #cbd5a7", borderRadius:14 }}>
+        <div style={{ display:"grid", gridTemplateColumns:`repeat(${columns.length}, ${colW}px)`, gap:8, minWidth:columns.length*colW, fontSize:13 }}>
+          {columns.map(h=>(
+            <div key={h} style={headerBox}>{h}</div>
+          ))}
+
+          {filtered.map((r, i) => (
+            <Fragment key={r.iccid || i}>
+              <div style={cellBox(i)}>{r.iccid ?? ""}</div>
+              <div style={cellBox(i)}>{r.imsi ?? ""}</div>
+              <div style={cellBox(i)}>{r.phoneNumber ?? ""}</div>
+              <div style={cellBox(i)}>{r.subscriberStatus ?? ""}</div>
+              <div style={cellBox(i)}>{r.simStatus ?? ""}</div>
+              <div style={cellBox(i)}>{String(r.esim ?? "")}</div>
+              <div style={cellBox(i)}>{r.activationCode ?? ""}</div>
+              <div style={cellBox(i)}>{fmtDT(r.activationDate)}</div>
+              <div style={cellBox(i)}>{fmtDT(r.lastUsageDate)}</div>
+              <div style={cellBox(i)}>{String(r.prepaid ?? "")}</div>
+              <div style={cellBox(i)}>{r.balance ?? ""}</div>
+              <div style={cellBox(i)}>{r.account ?? ""}</div>
+              <div style={cellBox(i)}>{r.reseller ?? ""}</div>
+              <div style={cellBox(i)}>{r.lastMcc ?? ""}</div>
+              <div style={cellBox(i)}>{r.lastMnc ?? ""}</div>
+              <div style={cellBox(i)}>{r.prepaidpackagetemplatename ?? ""}</div>
+              <div style={cellBox(i)}>{r.prepaidpackagetemplateid ?? ""}</div>
+              <div style={cellBox(i)}>{fmtDT(r.tsactivationutc)}</div>
+              <div style={cellBox(i)}>{fmtDT(r.tsexpirationutc)}</div>
+              <div style={cellBox(i)}>{r.pckdatabyte ?? ""}</div>
+              <div style={cellBox(i)}>{r.useddatabyte ?? ""}</div>
+              <div style={cellBox(i)}>{bytesToGB(r.pckdatabyte)}</div>
+              <div style={cellBox(i)}>{bytesToGB(r.useddatabyte)}</div>
+              <div style={cellBox(i)}>{money(r.subscriberOneTimeCost)}</div>
+              <div style={cellBox(i)}>{bytesToGB(r.totalBytesSinceJun1)}</div>
+              <div style={cellBox(i)}>{money(r.resellerCostSinceJun1)}</div>
+            </Fragment>
+          ))}
+        </div>
+      </div>
+
+      <p style={{ opacity:.7, marginTop:10, fontSize:12, color:"#000" }}>
+        Costs: package one-time from template; reseller cost aggregated since <b>2025-06-01</b>. PNL = Subscriber One-Time − Reseller Cost.
+      </p>
+    </main>
+  );
 }
