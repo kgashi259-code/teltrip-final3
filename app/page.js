@@ -22,6 +22,7 @@ async function fetchSubscribers() {
   });
 
   const data = await res.json();
+  console.log("📥 Raw listSubscriber response:", data); // 🔍 debug log
   return data.listSubscriberRsp?.subscriber || [];
 }
 
@@ -41,6 +42,7 @@ async function fetchPackageCost(templateId) {
   });
 
   const data = await res.json();
+  console.log("📦 Raw listPrepaidPackageTemplate response:", data); // 🔍 debug log
   const templates = data.listPrepaidPackageTemplateRsp?.prepaidPackageTemplate || [];
   return templates.length > 0 ? templates[0].cost : 0;
 }
@@ -54,7 +56,8 @@ export default function Dashboard() {
       try {
         const subs = await fetchSubscribers();
 
-        // add subscriberOneTimeCost
+        console.log("✅ Subscribers fetched:", subs); // 🔍 debug log
+
         const enriched = await Promise.all(
           subs.map(async (s) => {
             const cost = await fetchPackageCost(s.prepaidPackageTemplateId);
@@ -69,11 +72,12 @@ export default function Dashboard() {
               pckDataByte: s.pckDataByte,
               usedDataByte: s.usedDataByte,
               subscriberUsageOverPeriod: s.subscriberUsageOverPeriod,
-              subscriberOneTimeCost: cost, // ✅ now filled correctly
+              subscriberOneTimeCost: cost,
             };
           })
         );
 
+        console.log("💾 Enriched rows:", enriched); // 🔍 debug log
         setRows(enriched);
       } catch (err) {
         console.error("❌ Error loading dashboard:", err);
