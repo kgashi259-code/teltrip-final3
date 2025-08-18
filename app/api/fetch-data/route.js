@@ -2,7 +2,7 @@
 import { fetchAllData } from "../../../lib/teltrip";
 
 const BASE = process.env.NEXT_PUBLIC_OCS_BASE || "https://ocs-api.esimvault.cloud/v1";
-const TOKEN = process.env.NEXT_PUBLIC_OCS_TOKEN || "";
+const TOKEN = process.env.NEXT_PUBLIC_OCS_TOKEN || "HgljQn4Uhe6Ny07qTzYqPLjJ";
 
 export async function POST(req) {
   try {
