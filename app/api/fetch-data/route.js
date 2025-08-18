@@ -3,7 +3,7 @@ import { fetchAllData } from "../../../lib/teltrip";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 600; // allow longer processing on Vercel
+export const maxDuration = 60; // allow longer processing on Vercel
 
 export async function GET(req) {
   try {
